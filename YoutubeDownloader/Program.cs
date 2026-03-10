@@ -1,7 +1,9 @@
 ﻿using System;
 using System.Reflection;
+using System.Threading;
 using Avalonia;
 using Avalonia.WebView.Desktop;
+using YoutubeDownloader.Api;
 using YoutubeDownloader.Utils;
 
 namespace YoutubeDownloader;
@@ -28,6 +30,10 @@ public static class Program
     [STAThread]
     public static int Main(string[] args)
     {
+        // Start the background API server (http://localhost:5005)
+        using var cts = new CancellationTokenSource();
+        ApiServer.Start(cts.Token);
+
         // Build and run the app
         var builder = BuildAvaloniaApp();
 
@@ -44,6 +50,9 @@ public static class Program
         }
         finally
         {
+            // Signal the API server to shut down
+            cts.Cancel();
+
             // Clean up after application shutdown
             if (builder.Instance is IDisposable disposableApp)
                 disposableApp.Dispose();
