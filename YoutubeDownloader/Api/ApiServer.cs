@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Concurrent;
+using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Threading;
@@ -37,8 +38,10 @@ public class DownloadJob
 public static class ApiServer
 {
     private static readonly ConcurrentDictionary<string, DownloadJob> Jobs = new();
+    private static readonly SemaphoreSlim DownloadSemaphore = new(3, 3);
     private const string DownloadDirectory = @"d:\downloads";
     private const int Port = 5005;
+    private const int MaxBatchSize = 3;
 
     public static void Start(CancellationToken cancellationToken = default)
     {
@@ -67,45 +70,69 @@ public static class ApiServer
                 )
         );
 
-        // Start a download job
+        // Start one or more download jobs (max 3 URLs per request)
         app.MapPost(
             "/download",
             ([FromBody] DownloadRequest request) =>
             {
-                if (string.IsNullOrWhiteSpace(request.Url))
-                    return Results.BadRequest(new { error = "url is required" });
+                if (request.Urls is not { Count: > 0 })
+                    return Results.BadRequest(
+                        new { error = "urls list is required and must not be empty" }
+                    );
 
-                var job = new DownloadJob { Url = request.Url };
-                Jobs[job.Id] = job;
+                if (request.Urls.Count > MaxBatchSize)
+                    return Results.BadRequest(
+                        new { error = $"Maximum {MaxBatchSize} URLs per request" }
+                    );
 
-                _ = Task.Run(() => RunJobAsync(job, cancellationToken), cancellationToken);
+                var created = request
+                    .Urls.Where(u => !string.IsNullOrWhiteSpace(u))
+                    .Select(url =>
+                    {
+                        var job = new DownloadJob { Url = url };
+                        Jobs[job.Id] = job;
+                        _ = Task.Run(() => RunJobAsync(job, cancellationToken), cancellationToken);
+                        return new
+                        {
+                            jobId = job.Id,
+                            statusUrl = $"/status/{job.Id}",
+                            url = job.Url,
+                        };
+                    })
+                    .ToList();
 
-                return Results.Accepted(
-                    $"/status/{job.Id}",
-                    new { jobId = job.Id, statusUrl = $"/status/{job.Id}" }
-                );
+                return Results.Accepted("/status", new { jobs = created });
             }
         );
 
-        // Check job status
-        app.MapGet(
-            "/status/{jobId}",
-            (string jobId) =>
+        // Check status for a list of job IDs
+        app.MapPost(
+            "/status",
+            ([FromBody] StatusRequest request) =>
             {
-                if (!Jobs.TryGetValue(jobId, out var job))
-                    return Results.NotFound(new { error = "Job not found" });
+                if (request.JobIds is not { Count: > 0 })
+                    return Results.BadRequest(new { error = "jobIds list is required" });
 
-                return Results.Ok(
-                    new
+                var results = request
+                    .JobIds.Select(id =>
                     {
-                        jobId = job.Id,
-                        url = job.Url,
-                        status = job.Status.ToString().ToLowerInvariant(),
-                        progress = Math.Round(job.Progress * 100, 1),
-                        outputFilePath = job.OutputFilePath,
-                        error = job.Error,
-                    }
-                );
+                        if (!Jobs.TryGetValue(id, out var job))
+                            return (object)new { jobId = id, error = "Job not found" };
+
+                        return (object)
+                            new
+                            {
+                                jobId = job.Id,
+                                url = job.Url,
+                                status = job.Status.ToString().ToLowerInvariant(),
+                                progress = Math.Round(job.Progress * 100, 1),
+                                outputFilePath = job.OutputFilePath,
+                                error = job.Error,
+                            };
+                    })
+                    .ToList();
+
+                return Results.Ok(new { jobs = results });
             }
         );
 
@@ -131,6 +158,7 @@ public static class ApiServer
 
     private static async Task RunJobAsync(DownloadJob job, CancellationToken cancellationToken)
     {
+        await DownloadSemaphore.WaitAsync(cancellationToken);
         job.Status = JobStatus.Running;
 
         try
@@ -180,7 +208,13 @@ public static class ApiServer
             job.Error = ex.Message;
             job.Status = JobStatus.Failed;
         }
+        finally
+        {
+            DownloadSemaphore.Release();
+        }
     }
 
-    private record DownloadRequest(string Url);
+    private record DownloadRequest(List<string> Urls);
+
+    private record StatusRequest(List<string> JobIds);
 }
